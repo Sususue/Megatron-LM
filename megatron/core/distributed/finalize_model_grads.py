@@ -351,17 +351,26 @@ def _update_router_expert_bias(
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
-    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
-    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert,
-        stacked_expert_bias,
-        config.moe_router_bias_update_rate,
-        tp_dp_cp_group=tp_dp_cp_group,
-    )
-
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    # [TOP16 PATCH] heterogeneous per-layer expert counts (hash layers keep 256,
+    # pruned layers run top-16): group by shape so torch.stack stays well-defined,
+    # then update+all-reduce each group separately. Layer iteration order is
+    # identical on every rank, so all ranks form the same groups.
+    groups: dict = {}
+    for _tokens, _bias in zip(tokens_per_expert_list, expert_bias_list):
+        groups.setdefault(tuple(_tokens.shape), ([], []))
+        groups[tuple(_tokens.shape)][0].append(_tokens)
+        groups[tuple(_tokens.shape)][1].append(_bias)
+    for _t_list, _b_list in groups.values():
+        stacked_tokens_per_expert = torch.stack(_t_list, dim=0)
+        stacked_expert_bias = torch.stack(_b_list, dim=0)
+        stacked_updated_expert_bias = get_updated_expert_bias(
+            stacked_tokens_per_expert,
+            stacked_expert_bias,
+            config.moe_router_bias_update_rate,
+            tp_dp_cp_group=tp_dp_cp_group,
+        )
+        for expert_bias, updated_expert_bias in zip(_b_list, stacked_updated_expert_bias):
+            expert_bias.copy_(updated_expert_bias)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
